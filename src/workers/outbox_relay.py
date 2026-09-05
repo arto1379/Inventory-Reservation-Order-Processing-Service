@@ -23,6 +23,7 @@ from src.config import settings
 from src.database import SessionLocal
 from src.logging_config import configure_logging, log_event
 from src.repositories import outbox_repository
+from src.workers.low_stock_notifier import notify_low_stock_task
 from src.workers.order_processor import process_order_task
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ BATCH_SIZE = 50
 # touching the polling loop itself.
 _HANDLERS = {
     "ORDER_RESERVED": lambda payload: process_order_task.delay(payload["order_id"]),
+    "LOW_STOCK_ALERT_CREATED": lambda payload: notify_low_stock_task.delay(payload),
 }
 
 _shutdown_requested = False

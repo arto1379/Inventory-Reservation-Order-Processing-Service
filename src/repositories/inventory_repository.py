@@ -156,3 +156,76 @@ def create(db: Session, inventory: Inventory) -> Inventory:
     db.add(inventory)
     db.flush()
     return inventory
+
+
+def set_threshold(db: Session, product_id: str, warehouse_id: str, threshold: int) -> bool:
+    """
+    Set/update the low-stock threshold (Low-Stock Alerts add-on) and
+    recompute `is_low_stock` against the row's current `available_quantity`
+    in the same statement. Doing the comparison in SQL rather than reading
+    `available_quantity` in Python first and writing it back means a
+    concurrent reservation/adjustment touching this row can never be
+    clobbered by a stale read -- Postgres evaluates the comparison against
+    whatever value the row holds at UPDATE time, same as every other
+    mutation in this module.
+
+    Deliberately does not create an alert even if this recompute flips
+    `is_low_stock` to True: FR-2 reacts to inventory *moving* across the
+    threshold, not to the threshold being (re)configured around an
+    unchanged quantity. See docs/decisions/0005-low-stock-alerts.md.
+    """
+    stmt = (
+        update(Inventory)
+        .where(Inventory.product_id == product_id, Inventory.warehouse_id == warehouse_id)
+        .values(low_stock_threshold=threshold, is_low_stock=(Inventory.available_quantity <= threshold))
+    )
+    result = db.execute(stmt)
+    return result.rowcount == 1
+
+
+def try_flip_low_stock(db: Session, product_id: str, warehouse_id: str):
+    """
+    Atomically flip `is_low_stock` False -> True iff a threshold is
+    configured and `available_quantity` has fallen to or below it (FR-2).
+    Returns a Row with `available_quantity`/`low_stock_threshold` at the
+    moment of the flip, or None if no flip happened here -- because it was
+    already low-stock (FR-3: further decreases must not re-alert), no
+    threshold is configured, or the new quantity is still above it.
+
+    Guarding on `is_low_stock.is_(False)` in the WHERE clause is what makes
+    this safe under concurrency: exactly one of any number of racing
+    transactions decrementing this row can ever see a 0 -> 1 rowcount for
+    the same crossing, by the identical compare-and-swap reasoning as
+    `try_reserve` above (Postgres serializes concurrent UPDATEs to the same
+    row and re-evaluates the WHERE clause against the post-commit value).
+    """
+    stmt = (
+        update(Inventory)
+        .where(
+            Inventory.product_id == product_id,
+            Inventory.warehouse_id == warehouse_id,
+            Inventory.is_low_stock.is_(False),
+            Inventory.low_stock_threshold.isnot(None),
+            Inventory.available_quantity <= Inventory.low_stock_threshold,
+        )
+        .values(is_low_stock=True)
+        .returning(Inventory.available_quantity, Inventory.low_stock_threshold)
+    )
+    return db.execute(stmt).first()
+
+
+def try_reset_low_stock(db: Session, product_id: str, warehouse_id: str) -> bool:
+    """Atomically flip `is_low_stock` True -> False once `available_quantity`
+    has risen back above the configured threshold (FR-4), so the next
+    crossing below it can alert again (FR-5)."""
+    stmt = (
+        update(Inventory)
+        .where(
+            Inventory.product_id == product_id,
+            Inventory.warehouse_id == warehouse_id,
+            Inventory.is_low_stock.is_(True),
+            Inventory.available_quantity > Inventory.low_stock_threshold,
+        )
+        .values(is_low_stock=False)
+    )
+    return db.execute(stmt).rowcount == 1

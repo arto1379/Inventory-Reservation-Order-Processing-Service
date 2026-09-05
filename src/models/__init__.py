@@ -7,6 +7,7 @@ from src.models.audit_log import InventoryAuditLog  # noqa: F401
 from src.models.dead_letter import DeadLetterOrder  # noqa: F401
 from src.models.idempotency import IdempotencyKey  # noqa: F401
 from src.models.inventory import Inventory  # noqa: F401
+from src.models.low_stock_alert import LowStockAlert  # noqa: F401
 from src.models.order import Order, OrderItem  # noqa: F401
 from src.models.outbox import OutboxEvent  # noqa: F401
 from src.models.product import Product  # noqa: F401

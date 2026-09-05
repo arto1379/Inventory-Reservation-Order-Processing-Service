@@ -163,13 +163,22 @@ def warehouse(db_session) -> Warehouse:
     return w
 
 
-def make_inventory(db_session, product: Product, warehouse: Warehouse, available: int, reserved: int = 0) -> Inventory:
+def make_inventory(
+    db_session,
+    product: Product,
+    warehouse: Warehouse,
+    available: int,
+    reserved: int = 0,
+    low_stock_threshold: int | None = None,
+) -> Inventory:
     inv = Inventory(
         id=generate_id("inv"),
         product_id=product.id,
         warehouse_id=warehouse.id,
         available_quantity=available,
         reserved_quantity=reserved,
+        low_stock_threshold=low_stock_threshold,
+        is_low_stock=low_stock_threshold is not None and available <= low_stock_threshold,
     )
     db_session.add(inv)
     db_session.commit()
@@ -180,9 +189,16 @@ def make_inventory(db_session, product: Product, warehouse: Warehouse, available
 @pytest.fixture
 def inventory_factory(db_session):
     """Returns a callable so a test can create inventory with whatever
-    quantities it needs: `inventory_factory(product, warehouse, available=10)`."""
+    quantities it needs: `inventory_factory(product, warehouse, available=10)`,
+    optionally pre-configured with a low-stock threshold."""
 
-    def _factory(product: Product, warehouse: Warehouse, available: int, reserved: int = 0) -> Inventory:
-        return make_inventory(db_session, product, warehouse, available, reserved)
+    def _factory(
+        product: Product,
+        warehouse: Warehouse,
+        available: int,
+        reserved: int = 0,
+        low_stock_threshold: int | None = None,
+    ) -> Inventory:
+        return make_inventory(db_session, product, warehouse, available, reserved, low_stock_threshold)
 
     return _factory

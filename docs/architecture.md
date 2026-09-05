@@ -42,7 +42,12 @@ A modular monolith, per the PRD's explicit guidance ("do not over-engineer
 into many microservices"): one FastAPI process, one PostgreSQL database,
 one Redis instance used as both the Celery broker and result backend, and
 three background processes (Celery worker, Celery beat, outbox relay) that
-all share the same application code and the same database.
+all share the same application code and the same database. The Low-Stock
+Alerts add-on introduces no new process: its crossing detection runs
+inline inside the API request that changes stock, and its notification
+task (`workers.notify_low_stock`) runs on the same Celery worker shown
+above, dispatched by the same outbox relay via a second event type
+(`LOW_STOCK_ALERT_CREATED` alongside `ORDER_RESERVED`).
 
 ## Request/data flow: creating an order
 
@@ -73,6 +78,30 @@ all share the same application code and the same database.
 6. Independently, **Celery Beat** runs `expire_reservations` every
    `RESERVATION_CLEANUP_INTERVAL_SECONDS` to release any reservation whose
    `expires_at` has passed and mark its order `EXPIRED`.
+
+## Request/data flow: a low-stock crossing
+
+Piggybacks on step 2 above rather than adding a new entry point: whichever
+operation just decreased `available_quantity` (reserving stock for an
+order, same transaction as step 2; or a manual adjustment,
+`POST /inventory/adjustments`, its own transaction) calls
+`inventory_service._check_low_stock_transition` before it commits.
+
+1. An atomic conditional `UPDATE` (`inventory_repository.try_flip_low_stock`)
+   flips `is_low_stock` False -> True iff a threshold is configured and the
+   new quantity is at or below it — the exact compare-and-swap technique
+   from step 2, which is what makes a concurrent double-alert impossible.
+   See `docs/decisions/0005-low-stock-alerts.md`.
+2. If it flipped, a `low_stock_alerts` row and an `OutboxEvent`
+   (`LOW_STOCK_ALERT_CREATED`) are written in that same transaction.
+3. The outbox relay picks it up on its next poll exactly like
+   `ORDER_RESERVED`, and dispatches `notify_low_stock_task`
+   (`src/workers/low_stock_notifier.py`), which logs the event to simulate
+   notifying the warehouse team.
+
+A restock (available quantity rising back above the threshold) runs the
+mirror-image `try_reset_low_stock`, with no alert or outbox event — only a
+*decrease* crossing the threshold is ever alert-worthy.
 
 ## Layering
 

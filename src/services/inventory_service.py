@@ -9,6 +9,11 @@ larger transaction (e.g. "reserve every line item of an order, or none of
 them"). Only the top-level caller that owns the unit of work commits.
 `create_adjustment` is the exception: FR-3 is a standalone endpoint, so it
 owns its own transaction and commits directly.
+
+Low-Stock Alerts add-on: `_check_low_stock_transition` is called from
+every one of the functions above that changes `available_quantity`, in the
+same (uncommitted) transaction as that change -- see its docstring and
+`docs/decisions/0005-low-stock-alerts.md`.
 """
 from sqlalchemy.orm import Session
 
@@ -20,6 +25,8 @@ from src.models.reservation import InventoryReservation
 from src.repositories import (
     audit_repository,
     inventory_repository,
+    low_stock_alert_repository,
+    outbox_repository,
     product_repository,
     reservation_repository,
     warehouse_repository,
@@ -79,6 +86,7 @@ def create_adjustment(db: Session, payload: InventoryAdjustmentRequest) -> Inven
                 "Adjustment would drive available inventory below zero",
                 {"product_id": payload.product_id, "warehouse_id": payload.warehouse_id, "quantity": payload.quantity},
             )
+        _check_low_stock_transition(db, payload.product_id, payload.warehouse_id, delta=payload.quantity)
         db.refresh(row)
 
     event_type = AuditEventType.STOCK_ADDED if payload.quantity >= 0 else AuditEventType.STOCK_REMOVED
@@ -109,6 +117,7 @@ def reserve(db: Session, *, product_id: str, warehouse_id: str, quantity: int, o
             event_type=AuditEventType.INVENTORY_RESERVED,
             reference_id=order_id,
         )
+        _check_low_stock_transition(db, product_id, warehouse_id, delta=-quantity)
     return ok
 
 
@@ -128,6 +137,7 @@ def release_reservation(db: Session, reservation: InventoryReservation, *, refer
         event_type=AuditEventType.RESERVATION_RELEASED,
         reference_id=reference_id,
     )
+    _check_low_stock_transition(db, reservation.product_id, reservation.warehouse_id, delta=reservation.quantity)
     return True
 
 
@@ -145,6 +155,51 @@ def consume_reservation(db: Session, reservation: InventoryReservation, *, order
         reference_id=order_id,
     )
     return True
+
+
+def _check_low_stock_transition(db: Session, product_id: str, warehouse_id: str, *, delta: int) -> None:
+    """
+    Low-Stock Alerts add-on (FR-2..FR-5): called after every operation that
+    changes `available_quantity` (reserve, release, manual adjustment --
+    NOT consume, which only moves reserved_quantity). `delta` is signed
+    from the caller's point of view: negative means available_quantity
+    just decreased (a stock-out direction, might cross the threshold going
+    down), positive means it increased (might restock above the
+    threshold and reset the low-stock state). Runs in the caller's
+    existing transaction -- no commit here -- so the alert (and its outbox
+    event) can never exist without the inventory change that caused it,
+    or vice versa.
+    """
+    if delta < 0:
+        flip = inventory_repository.try_flip_low_stock(db, product_id, warehouse_id)
+        if flip is None:
+            return
+        alert = low_stock_alert_repository.create(
+            db,
+            product_id=product_id,
+            warehouse_id=warehouse_id,
+            quantity_at_alert=flip.available_quantity,
+            threshold=flip.low_stock_threshold,
+        )
+        # Bonus extension (PRD section 9): same transaction/commit as the
+        # alert row, so a crash can never lose the notification -- see
+        # docs/decisions/0003-outbox-pattern.md for why this pattern is
+        # reused verbatim here instead of publishing directly.
+        outbox_repository.create(
+            db,
+            aggregate_type="low_stock_alert",
+            aggregate_id=alert.id,
+            event_type="LOW_STOCK_ALERT_CREATED",
+            payload={
+                "alert_id": alert.id,
+                "product_id": product_id,
+                "warehouse_id": warehouse_id,
+                "quantity_at_alert": flip.available_quantity,
+                "threshold": flip.low_stock_threshold,
+            },
+        )
+    elif delta > 0:
+        inventory_repository.try_reset_low_stock(db, product_id, warehouse_id)
 
 
 def _raise_product_not_found(product_id: str) -> None:

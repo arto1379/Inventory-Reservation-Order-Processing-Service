@@ -19,6 +19,7 @@ Celery + Redis**, and JWT authentication.
 - [How inventory concurrency is handled](#how-inventory-concurrency-is-handled)
 - [How idempotency is implemented](#how-idempotency-is-implemented)
 - [Order lifecycle](#order-lifecycle)
+- [Low-stock alerts](#low-stock-alerts)
 - [Authentication & authorization](#authentication--authorization)
 - [Configuration](#configuration)
 - [Important architectural decisions](#important-architectural-decisions)
@@ -146,6 +147,10 @@ What's covered:
 | `tests/integration/test_outbox_relay.py` | Outbox row written transactionally, relay publishes + triggers processing |
 | `tests/integration/test_full_flow.py` | The end-to-end flow from PRD section 24, plus audit trail |
 | `tests/concurrency/test_concurrent_reservation.py` | **The required PRD section 25 test**: 10 units, 100 simultaneous requests, exactly 10 succeed, 90 fail, final inventory = 0, never negative |
+| `tests/unit/test_low_stock_service.py` | Low-stock threshold configuration, crossing/no-alert/reset/re-alert state transitions (add-on required tests 1-6) |
+| `tests/integration/test_low_stock_api.py` | Threshold endpoint validation/RBAC/404s, alert listing + warehouse filter |
+| `tests/integration/test_low_stock_notification.py` | Crossing writes a pending outbox event; relay publishes it and the notifier logs it |
+| `tests/concurrency/test_concurrent_low_stock_alerts.py` | **Add-on required test 7**: 10 units, threshold 5, 100 simultaneous requests, exactly one alert created for the single crossing |
 
 ## Trying the API
 
@@ -225,6 +230,13 @@ PostgreSQL, managed with Alembic (`migrations/versions/0001_initial_schema.py`).
 | `idempotency_keys` | idempotent order creation | PK `key` |
 | `outbox_events` | transactional outbox (Bonus C) | indexed on `status` for relay polling |
 | `dead_letter_orders` | repeatedly-failed orders (Bonus B) | FK to `orders` |
+| `low_stock_alerts` | one row per threshold crossing (Low-Stock Alerts add-on) | FK to `products`, `warehouses`; indexed on `(warehouse_id, created_at)` for FR-6 listing |
+
+`inventory` also carries `low_stock_threshold` (nullable — unset means no
+alerting configured for that pair) and `is_low_stock` (current alert
+state), added by the Low-Stock Alerts add-on; `CHECK (low_stock_threshold
+IS NULL OR low_stock_threshold >= 0)` mirrors the same
+last-line-of-defense philosophy as the two constraints above it.
 
 **Indexes** beyond the constraints above: `orders(status)`,
 `orders(created_at)`, `orders(created_by_user_id)` (list/filter/RBAC-scope
@@ -294,6 +306,34 @@ decreases; `available_quantity` was already decremented at reservation
 time); `FAILED`/`CANCELLED`/`EXPIRED` release it
 (`available_quantity` restored, `reserved_quantity` decreases).
 
+## Low-stock alerts
+
+A small add-on, layered on top of the core reservation flow without
+touching it (PRD: "Add a low-stock alert feature without changing the
+existing order flow"):
+
+```
+PUT  /api/v1/inventory/{product_id}/warehouses/{warehouse_id}/low-stock-threshold   {"threshold": 5}
+GET  /api/v1/inventory/low-stock[?warehouse_id=wh_001]
+```
+
+An admin sets a non-negative threshold per `(product, warehouse)` pair; the
+system reacts to inventory *crossing* down through that threshold (not to
+the current quantity — repeatedly checking "is stock below X" would
+re-alert on every read while stock stays low), creates exactly one alert
+per crossing, and resets once restocked above the threshold so the next
+crossing alerts again. Every mutation of `available_quantity` (reserve,
+release, manual adjustment) atomically checks for a crossing in the same
+database transaction, using the identical compare-and-swap technique as
+inventory reservation itself, so concurrent stock changes can't produce
+duplicate alerts. Full rationale, including the two interview-question
+alternatives considered and rejected:
+**[docs/decisions/0005-low-stock-alerts.md](docs/decisions/0005-low-stock-alerts.md)**.
+
+As a bonus extension, each alert also writes a transactional outbox event
+(`LOW_STOCK_ALERT_CREATED`), relayed the same way as `ORDER_RESERVED`, to a
+worker that simulates notifying the warehouse team by logging the event.
+
 ## Authentication & authorization
 
 JWT bearer tokens (`Authorization: Bearer <token>`), issued by
@@ -303,6 +343,7 @@ JWT bearer tokens (`Authorization: Bearer <token>`), issued by
 |---|:---:|:---:|
 | Create products / warehouses | ✅ | ❌ |
 | Adjust / retrieve inventory | ✅ | ❌ |
+| Configure low-stock threshold / list alerts | ✅ | ❌ |
 | Create / retrieve / cancel **own** orders | — | ✅ |
 | View **any** order | ✅ | own only |
 | Look up a product by ID | ✅ | ✅ (needed to build an order) |
@@ -333,6 +374,7 @@ full under `docs/decisions/`:
 - **[0002 — Idempotency-Key implementation](docs/decisions/0002-idempotency.md)**
 - **[0003 — Transactional outbox pattern](docs/decisions/0003-outbox-pattern.md)** (answers "what if the API commits but crashes before publishing?")
 - **[0004 — IDs, warehouse selection, worker retries](docs/decisions/0004-ids-warehouse-selection-retries.md)**
+- **[0005 — Low-stock alerts](docs/decisions/0005-low-stock-alerts.md)** (feature add-on: crossing detection, concurrency, notification idempotency, per-warehouse thresholds)
 
 A few more, briefly:
 
@@ -361,6 +403,7 @@ A few more, briefly:
 | C — Transactional outbox | ✅ | See decision doc 0003. This is the bonus with the highest correctness payoff for this project and was prioritized accordingly. |
 | D — Prometheus metrics | ❌ | Not implemented — see "What I'd improve". |
 | E — Rate limiting | ❌ | Not implemented — see "What I'd improve". |
+| Low-stock alert notifications via outbox | ✅ | `LOW_STOCK_ALERT_CREATED` events reuse the same outbox/relay path as `ORDER_RESERVED`; see [Low-stock alerts](#low-stock-alerts). |
 
 Per the PRD's own guidance ("a strong implementation of the core
 requirements is more valuable than every bonus feature"), effort was

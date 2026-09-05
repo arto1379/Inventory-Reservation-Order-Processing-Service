@@ -18,7 +18,7 @@ celery_app = Celery(
     "inventory_order_service",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["src.workers.order_processor", "src.workers.reservation_cleanup"],
+    include=["src.workers.order_processor", "src.workers.reservation_cleanup", "src.workers.low_stock_notifier"],
 )
 
 celery_app.conf.update(

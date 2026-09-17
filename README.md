@@ -26,6 +26,7 @@ Celery + Redis**, and JWT authentication.
 - [Bonus features implemented](#bonus-features-implemented)
 - [Known limitations](#known-limitations)
 - [What I'd improve with more time](#what-id-improve-with-more-time)
+- [License](#license)
 
 ## Architecture
 
@@ -468,3 +469,9 @@ D and E were the two lowest-leverage bonuses for that goal.
    followed by Order Processing/Payment simulation; Product/Warehouse
    catalog data is low-write and could stay in the monolith or become a
    thin read-mostly service much later.
+
+## License
+
+[MIT](LICENSE) — free to use, copy, and modify, provided the copyright
+notice is kept. Provided "as is", with no warranty; the author is not
+liable for any outcome from using this software, including in production.
